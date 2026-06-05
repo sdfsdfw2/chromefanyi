@@ -29,6 +29,7 @@
   // 用 Map 而非 WeakMap，因为 key 是字符串（原始文本），生命周期等于整个会话
   const TRANS_CACHE = new Map();   // text → translatedText
   const PENDING_MAP = new Map();   // text → Promise<string|null>（正在请求中）
+  const _translatedData = new Map(); // TextNode → { original, translated } 跟踪文本节点翻译
 
   // ─── 全局状态 ────────────────────────────────────────────────────────────────
   const STATE = {
@@ -49,19 +50,8 @@
     const s = document.createElement('style');
     s.id = 'wu-style';
     s.textContent = `
-      ._wu_t {
-        cursor: pointer;
-        position: relative;
-        border-bottom: 1px dotted transparent;
-        transition: background .15s, border-color .15s;
-      }
-      ._wu_t:hover {
-        background: rgba(74,108,247,.1);
-        border-radius: 3px;
-        border-bottom-color: rgba(74,108,247,.5);
-      }
-      ._wu_t[data-o]:hover::after {
-        content: attr(data-o);
+      [data-wu-o]:hover::after {
+        content: attr(data-wu-o);
         position: fixed;
         bottom: 12px; left: 12px; right: 12px;
         max-width: 520px;
@@ -137,8 +127,8 @@
           if (!par) return NodeFilter.FILTER_REJECT;
           // 已是翻译 span 内部 → 跳过
           if (par.dataset && par.dataset.wuT) return NodeFilter.FILTER_REJECT;
-          // 祖先是翻译 span → 跳过
           if (par.closest && par.closest('[data-wu-t]')) return NodeFilter.FILTER_REJECT;
+          if (_translatedData.has(n)) return NodeFilter.FILTER_REJECT;
           if (isCode(par)) return NodeFilter.FILTER_REJECT;
           if (skipText(n.textContent)) return NodeFilter.FILTER_REJECT;
           return NodeFilter.FILTER_ACCEPT;
@@ -182,20 +172,15 @@
     return [...collectTextNodes(root), ...collectAttrs(root)];
   }
 
-  // ─── 应用单条翻译（立即写入DOM）─────────────────────────────────────────────
+  // ─── 应用单条翻译（直接修改 textContent，不改变 DOM 结构）──────────────────
   function applyTextNode(node, orig, tr) {
     if (!tr || tr === orig) return false;
     const par = node.parentElement;
-    if (!par) return false;
-    // 已在翻译容器内 → 跳过
-    if (par.dataset && par.dataset.wuT) return false;
+    if (!par || _translatedData.has(node)) return false;
     try {
-      const span = document.createElement('span');
-      span.className = '_wu_t';
-      span.dataset.wuT = '1';      // 标识符，供 TreeWalker 过滤
-      span.dataset.o   = orig;
-      span.textContent = tr;
-      par.replaceChild(span, node);
+      node.textContent = tr;
+      _translatedData.set(node, { original: orig, translated: tr });
+      if (!par.hasAttribute('data-wu-o')) par.dataset.wuO = orig;
       return true;
     } catch { return false; }
   }
@@ -492,10 +477,15 @@
 
       for (const mut of mutations) {
         if (mut.type === 'characterData') {
-          const par = mut.target.parentElement;
-          if (par && !(par.dataset && par.dataset.wuT)) {
-            STATE.pendingRoots.add(par);
+          const node = mut.target;
+          const par = node.parentElement;
+          if (!par || (par.dataset && par.dataset.wuT)) continue;
+          if (_translatedData.has(node)) {
+            const data = _translatedData.get(node);
+            if (node.textContent === data.translated) continue;
+            _translatedData.delete(node);
           }
+          STATE.pendingRoots.add(par);
         } else if (mut.type === 'childList') {
           for (const node of mut.addedNodes) {
             if (node.nodeType === 1) {
@@ -599,6 +589,13 @@
   function restore() {
     stopObserver();
 
+    // ① 新方式：恢复通过 textContent 直接翻译的文本节点（不改 DOM 结构）
+    for (const [node, data] of _translatedData) {
+      try { node.textContent = data.original; } catch {}
+    }
+    _translatedData.clear();
+
+    // ② 旧方式兼容：恢复 _wu_t 包裹的 span（更新前已翻译的页面）
     for (const span of document.querySelectorAll('._wu_t')) {
       const orig = span.dataset.o;
       if (orig !== undefined) {
@@ -606,7 +603,7 @@
       }
     }
 
-    // 恢复属性
+    // ③ 恢复属性
     for (const el of document.querySelectorAll('*')) {
       for (const a of ATTR_KEYS) {
         const orig = el.getAttribute(a + '-orig');
@@ -614,6 +611,11 @@
           try { el.setAttribute(a, orig); el.removeAttribute(a + '-orig'); } catch {}
         }
       }
+    }
+
+    // ④ 清理 data-wu-o 属性
+    for (const el of document.querySelectorAll('[data-wu-o]')) {
+      el.removeAttribute('data-wu-o');
     }
 
     // 重置状态（注意：保留 TRANS_CACHE，重新翻译时直接命中！）

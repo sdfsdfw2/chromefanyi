@@ -44,7 +44,7 @@ async function handleAIfetch(req) {
         'Content-Type': 'application/json',
       },
       body,
-      signal: AbortSignal.timeout(25000),
+      signal: AbortSignal.timeout(120000),
     });
 
     if (!res.ok) {

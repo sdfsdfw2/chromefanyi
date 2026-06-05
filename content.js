@@ -31,6 +31,10 @@
   const PENDING_MAP = new Map();   // text → Promise<string|null>（正在请求中）
   const _translatedData = new Map(); // TextNode → { original, translated } 跟踪文本节点翻译
 
+  function reportProgress(done, total) {
+    chrome.runtime.sendMessage({ action: 'progress', done, total }).catch(() => {});
+  }
+
   // ─── 全局状态 ────────────────────────────────────────────────────────────────
   const STATE = {
     active:     false,    // 是否已开启翻译
@@ -49,23 +53,7 @@
     cssInjected = true;
     const s = document.createElement('style');
     s.id = 'wu-style';
-    s.textContent = `
-      [data-wu-o]:hover::after {
-        content: attr(data-wu-o);
-        position: fixed;
-        bottom: 12px; left: 12px; right: 12px;
-        max-width: 520px;
-        padding: 7px 12px;
-        font-size: 12px; line-height: 1.55;
-        color: #fff;
-        background: rgba(18,18,28,.93);
-        border-radius: 7px;
-        white-space: pre-wrap; word-break: break-all;
-        z-index: 2147483647; pointer-events: none;
-        box-shadow: 0 4px 18px rgba(0,0,0,.45);
-        backdrop-filter: blur(6px);
-      }
-    `;
+    s.textContent = ``;
     (document.head || document.documentElement).appendChild(s);
   }
 
@@ -180,7 +168,6 @@
     try {
       node.textContent = tr;
       _translatedData.set(node, { original: orig, translated: tr });
-      if (!par.hasAttribute('data-wu-o')) par.dataset.wuO = orig;
       return true;
     } catch { return false; }
   }
@@ -197,6 +184,7 @@
   // 对一批文本：先同步应用缓存命中的，再异步请求未缓存的
   async function translateItemsWithCache(items, settings) {
     if (!items.length) return;
+    const total = items.length;
 
     const textItems = items.filter(i => i.type === 'text');
     const attrItems = items.filter(i => i.type === 'attr');
@@ -204,30 +192,28 @@
     // ① 同步阶段：立即应用已缓存的翻译（无需等待网络！）
     const uncachedText = [];
     const uncachedAttr = [];
+    let applied = 0;
 
     for (const item of textItems) {
       if (!item.node.isConnected) continue;
-      const cached = TRANS_CACHE.get(item.text);
-      if (cached) {
-        applyTextNode(item.node, item.text, cached);
-      } else if (PENDING_MAP.has(item.text)) {
-        // 已有请求在飞 → 复用 Promise
-        uncachedText.push(item);
+      if (TRANS_CACHE.has(item.text)) {
+        applyTextNode(item.node, item.text, TRANS_CACHE.get(item.text));
+        applied++;
       } else {
         uncachedText.push(item);
       }
     }
 
     for (const item of attrItems) {
-      const cached = TRANS_CACHE.get(item.text);
-      if (cached) {
-        applyAttr(item.el, item.attr, item.text, cached);
+      if (TRANS_CACHE.has(item.text)) {
+        applyAttr(item.el, item.attr, item.text, TRANS_CACHE.get(item.text));
+        applied++;
       } else {
         uncachedAttr.push(item);
       }
     }
 
-    // ② 异步阶段：批量获取未缓存的
+    reportProgress(applied, total);
     if (!uncachedText.length && !uncachedAttr.length) return;
 
     // 根据节点在视口中的位置进行优先级排序，优先翻译可见区域
@@ -236,24 +222,26 @@
       const el = item.node ? item.node.parentElement : item.el;
       if (!el || !el.getBoundingClientRect) return 99999;
       const rect = el.getBoundingClientRect();
-      if (rect.bottom < 0) return Math.abs(rect.bottom) + 10000; // 屏幕上方
-      if (rect.top > vh) return rect.top + 10000; // 屏幕下方
-      return rect.top; // 屏幕内，按从上到下排序
+      if (rect.bottom < 0) return Math.abs(rect.bottom) + 10000;
+      if (rect.top > vh) return rect.top + 10000;
+      return rect.top;
     }
 
     const allUncachedItems = [...uncachedText, ...uncachedAttr];
     allUncachedItems.sort((a, b) => getScore(a) - getScore(b));
 
-    const allUncached = [...new Set(allUncachedItems.map(i => i.text))];
+    const textSet = new Set(allUncachedItems.map(i => i.text));
+    const allUncached = [...textSet];
 
-    // 去掉已有 PENDING 的
     const toFetch = allUncached.filter(t => !PENDING_MAP.has(t));
 
     if (toFetch.length) {
-      await fetchAndCache(toFetch, settings);
+      const uncachedTotal = textSet.size;
+      await fetchAndCache(toFetch, settings, (done, fetchTotal) => {
+        reportProgress(applied + Math.round(done / fetchTotal * (total - applied)), total);
+      });
     }
 
-    // 等待所有涉及的 PENDING
     const allPending = allUncached
       .filter(t => PENDING_MAP.has(t))
       .map(t => PENDING_MAP.get(t));
@@ -262,42 +250,83 @@
     // ③ 应用结果（此时缓存已填充）
     for (const item of uncachedText) {
       if (!item.node.isConnected) continue;
-      // 再次检查节点是否已被翻译（可能上面的并发请求已处理）
       const par = item.node.parentElement;
       if (!par || (par.dataset && par.dataset.wuT)) continue;
       const tr = TRANS_CACHE.get(item.text);
-      if (tr) applyTextNode(item.node, item.text, tr);
+      if (tr) { applyTextNode(item.node, item.text, tr); applied++; }
     }
     for (const item of uncachedAttr) {
       if (item.el.hasAttribute(item.attr + '-orig')) continue;
       const tr = TRANS_CACHE.get(item.text);
-      if (tr) applyAttr(item.el, item.attr, item.text, tr);
+      if (tr) { applyAttr(item.el, item.attr, item.text, tr); applied++; }
     }
+
+    // ④ 个别重试：batch 失败导致仍未缓存的文本，逐条重试
+    if (settings.engine === 'openai') {
+      for (const item of uncachedText) {
+        if (!item.node.isConnected) continue;
+        const par = item.node.parentElement;
+        if (!par || (par.dataset && par.dataset.wuT)) continue;
+        if (TRANS_CACHE.has(item.text)) continue;
+        const tr = await fetchIndividualAI(item.text, settings);
+        if (tr) {
+          TRANS_CACHE.set(item.text, tr);
+          applyTextNode(item.node, item.text, tr);
+          applied++;
+          reportProgress(applied, total);
+        }
+      }
+    }
+
+    reportProgress(applied, total);
+  }
+
+  async function fetchIndividualAI(text, settings) {
+    const ep = (settings.openaiEndpoint || 'https://api.siliconflow.cn/v1/chat/completions')
+      .replace(/\/chat\/completions\/?$/i,'').replace(/\/+$/,'');
+    const cfg = { endpoint: ep, apiKey: settings.openaiApiKey, model: settings.openaiModel };
+    const target = LANG_MAP[settings.to] || settings.to;
+    try {
+      const r = await sendMessageWithTimeout({
+        action: 'aifetch', texts: [text], from: settings.from, to: target, config: cfg
+      }, 130000);
+      if (r?.tr?.[0] && r.tr[0] !== text) return r.tr[0];
+    } catch {}
+    return null;
   }
 
   // ─── 网络请求层（填充 TRANS_CACHE）──────────────────────────────────────────────
-  async function fetchAndCache(texts, settings) {
+  async function fetchAndCache(texts, settings, onProgress) {
     if (!texts.length) return;
     const unique = [...new Set(texts)];
+    const totalUnique = unique.length;
+    let fetchedCount = 0;
 
     if (settings.engine === 'google') {
-      // 每批最多 60 条，并发发出（每条内部已是合并请求）
       const BATCH = 60;
       const batches = [];
       for (let i = 0; i < unique.length; i += BATCH) batches.push(unique.slice(i, i + BATCH));
-      // 并发所有批次（每批内部已是单个 HTTP 请求）
-      await Promise.allSettled(batches.map(batch => fetchGoogleBatch(batch, settings)));
+      await Promise.allSettled(batches.map(async batch => {
+        await fetchGoogleBatch(batch, settings);
+        const newlyCached = batch.filter(t => TRANS_CACHE.has(t)).length;
+        fetchedCount += newlyCached;
+        onProgress?.(fetchedCount, totalUnique);
+      }));
 
     } else if (settings.engine === 'openai') {
-      const BATCH = 25;  // 增加到 25 条
+      const BATCH = 20;
       const ep = (settings.openaiEndpoint || 'https://api.siliconflow.cn/v1/chat/completions')
         .replace(/\/chat\/completions\/?$/i,'').replace(/\/+$/,'');
       const cfg = { endpoint: ep, apiKey: settings.openaiApiKey, model: settings.openaiModel };
       const target = LANG_MAP[settings.to] || settings.to;
       const batches = [];
       for (let i = 0; i < unique.length; i += BATCH) batches.push(unique.slice(i, i + BATCH));
-      // 并发数提升到 5
-      await runWithConcurrency(5, batches, batch => fetchOpenAIBatch(batch, settings.from, target, cfg));
+      await runWithConcurrency(20, batches, async batch => {
+        await fetchOpenAIBatch(batch, settings.from, target, cfg);
+        const newlyCached = batch.filter(t => TRANS_CACHE.has(t)).length;
+        fetchedCount += newlyCached;
+        onProgress?.(fetchedCount, totalUnique);
+      });
     }
   }
 
@@ -390,27 +419,35 @@
     } catch { return null; }
   }
 
+  async function sendMessageWithTimeout(msg, ms) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('sendMessage timeout')), ms);
+      chrome.runtime.sendMessage(msg).then(r => {
+        clearTimeout(timer); resolve(r);
+      }).catch(e => {
+        clearTimeout(timer); reject(e);
+      });
+    });
+  }
+
   async function fetchOpenAIBatch(texts, from, target, cfg, _retry = false) {
-    // ① 发请求前，把所有文本注册到 PENDING_MAP，防止并发重复请求
     const myTexts = texts.filter(t => {
-      if (PENDING_MAP.has(t)) return false;  // 已有飞行中请求，跳过
-      if (TRANS_CACHE.has(t)) return false;  // 已缓存，跳过
+      if (PENDING_MAP.has(t)) return false;
+      if (TRANS_CACHE.has(t)) return false;
       return true;
     });
     if (!myTexts.length) return;
 
-    // 创建统一的 promise，所有 myTexts 共享
     let resolveAll;
     const batchPromise = new Promise(res => { resolveAll = res; });
     myTexts.forEach(t => PENDING_MAP.set(t, batchPromise));
 
     try {
-      const r = await chrome.runtime.sendMessage({
+      const r = await sendMessageWithTimeout({
         action: 'aifetch', texts: myTexts, from, to: target, config: cfg
-      });
+      }, 130000);
 
       if (r?.tr && Array.isArray(r.tr) && r.tr.length > 0) {
-        // 成功：写入缓存，清除 PENDING
         r.tr.forEach((tr, i) => {
           const orig = myTexts[i];
           if (tr && tr !== orig) TRANS_CACHE.set(orig, tr);
@@ -420,7 +457,6 @@
         return r.tr;
       }
 
-      // AI 返回空或格式错误 → 如果还没重试过，拆半再试
       if (!_retry && myTexts.length > 1) {
         myTexts.forEach(t => PENDING_MAP.delete(t));
         resolveAll(null);
@@ -432,10 +468,9 @@
         return;
       }
     } catch (e) {
-      console.warn('[WuTranslator] OpenAI fetch error:', e?.message);
+      console.warn('[WuTranslator] OpenAI fetch timeout/error:', e?.message);
     }
 
-    // 彻底失败：清除 PENDING
     myTexts.forEach(t => PENDING_MAP.delete(t));
     resolveAll(null);
   }
@@ -611,11 +646,6 @@
           try { el.setAttribute(a, orig); el.removeAttribute(a + '-orig'); } catch {}
         }
       }
-    }
-
-    // ④ 清理 data-wu-o 属性
-    for (const el of document.querySelectorAll('[data-wu-o]')) {
-      el.removeAttribute('data-wu-o');
     }
 
     // 重置状态（注意：保留 TRANS_CACHE，重新翻译时直接命中！）
